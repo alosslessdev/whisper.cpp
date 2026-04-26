@@ -3457,10 +3457,14 @@ struct whisper_state * whisper_init_state(whisper_context * ctx) {
 
     state->logits.reserve(ctx->vocab.n_vocab * ctx->model.hparams.n_text_ctx);
 
-    state->batch = whisper_batch_init(ctx->model.hparams.n_text_ctx, WHISPER_MAX_DECODERS);
+    int n_batch = ctx->model.hparams.n_text_ctx;
+    if (ctx->params.n_batch > 0) {
+        n_batch = std::min(n_batch, ctx->params.n_batch);
+    }
+    state->batch = whisper_batch_init(n_batch, WHISPER_MAX_DECODERS);
 
     // TAGS: WHISPER_DECODER_INIT
-    state->decoders[0].sequence.tokens.reserve(ctx->model.hparams.n_text_ctx);
+    state->decoders[0].sequence.tokens.reserve(n_batch);
 
     state->decoders[0].probs.reserve    (ctx->vocab.n_vocab);
     state->decoders[0].logits.reserve   (ctx->vocab.n_vocab);
@@ -3608,6 +3612,7 @@ struct whisper_context_params whisper_context_default_params() {
         /*.use_gpu              =*/ true,
         /*.flash_attn           =*/ true,
         /*.gpu_device           =*/ 0,
+        /*.n_batch             =*/ -1,
 
         /*.dtw_token_timestamps =*/ false,
         /*.dtw_aheads_preset    =*/ WHISPER_AHEADS_NONE,

@@ -117,6 +117,7 @@ extern "C" {
         bool  use_gpu;
         bool  flash_attn;
         int   gpu_device;  // CUDA device
+        int   n_batch;
 
         // [EXPERIMENTAL] Token-level timestamps with DTW
         bool dtw_token_timestamps;

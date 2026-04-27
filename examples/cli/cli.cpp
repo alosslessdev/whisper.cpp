@@ -78,6 +78,8 @@ struct whisper_params {
     bool use_gpu         = true;
     bool flash_attn      = true;
     int32_t gpu_device   = 0;
+    int32_t n_batch     = -1;
+    int32_t batch_size   = 1;    // batch size for batched inference (parallel segments)
     bool suppress_nst    = false;
     bool carry_initial_prompt = false;
 
@@ -201,6 +203,8 @@ static bool whisper_params_parse(int argc, char ** argv, whisper_params & params
         else if (arg == "-ls"   || arg == "--log-score")            { params.log_score       = true; }
         else if (arg == "-ng"   || arg == "--no-gpu")               { params.use_gpu         = false; }
         else if (arg == "-dev"  || arg == "--device")               { params.gpu_device      = std::stoi(ARGV_NEXT); }
+        else if (arg == "-nb"   || arg == "--n-batch")             { params.n_batch         = std::stoi(ARGV_NEXT); }
+        else if (arg == "-bs"   || arg == "--batch-size")           { params.batch_size     = std::stoi(ARGV_NEXT); }
         else if (arg == "-fa"   || arg == "--flash-attn")           { params.flash_attn      = true; }
         else if (arg == "-nfa"  || arg == "--no-flash-attn")        { params.flash_attn      = false; }
         else if (arg == "-sns"  || arg == "--suppress-nst")         { params.suppress_nst    = true; }
@@ -283,6 +287,8 @@ static void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params
     fprintf(stderr, "  -ls,       --log-score            [%-7s] log best decoder scores of tokens\n",              params.log_score?"true":"false");
     fprintf(stderr, "  -ng,       --no-gpu               [%-7s] disable GPU\n",                                    params.use_gpu ? "false" : "true");
     fprintf(stderr, "  -dev N,    --device N             [%-7d] GPU device ID (default: 0)\n",                     params.gpu_device);
+    fprintf(stderr, "  -nb N,     --n-batch N            [%-7d] decoder batch size (-1 = model default)\n",       params.n_batch);
+    fprintf(stderr, "  -bs N,     --batch-size N         [%-7d] batch size for parallel segment processing\n", params.batch_size);
     fprintf(stderr, "  -fa,       --flash-attn           [%-7s] enable flash attention\n",                         params.flash_attn ? "true" : "false");
     fprintf(stderr, "  -nfa,      --no-flash-attn        [%-7s] disable flash attention\n",                        params.flash_attn ? "false" : "true");
     fprintf(stderr, "  -sns,      --suppress-nst         [%-7s] suppress non-speech tokens\n",                     params.suppress_nst ? "true" : "false");
@@ -1221,6 +1227,8 @@ int main(int argc, char ** argv) {
             wparams.vad_params.speech_pad_ms           = params.vad_speech_pad_ms;
             wparams.vad_params.samples_overlap         = params.vad_samples_overlap;
 
+            wparams.batch_size = params.batch_size;
+
             whisper_print_user_data user_data = { &params, &pcmf32s, 0 };
 
             const auto & grammar_parsed = params.grammar_parsed;
@@ -1273,7 +1281,13 @@ int main(int argc, char ** argv) {
                 wparams.abort_callback_user_data = &is_aborted;
             }
 
-            if (whisper_full_parallel(ctx, wparams, pcmf32.data(), pcmf32.size(), params.n_processors) != 0) {
+            // run the inference - use batched if batch_size > 1
+            if (params.batch_size > 1) {
+                if (whisper_full_batched(ctx, wparams, pcmf32.data(), pcmf32.size(), params.batch_size) != 0) {
+                    fprintf(stderr, "%s: failed to process audio with batched inference\n", argv[0]);
+                    return 10;
+                }
+            } else if (whisper_full_parallel(ctx, wparams, pcmf32.data(), pcmf32.size(), params.n_processors) != 0) {
                 fprintf(stderr, "%s: failed to process audio\n", argv[0]);
                 return 10;
             }

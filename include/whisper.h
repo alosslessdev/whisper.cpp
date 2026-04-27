@@ -588,6 +588,9 @@ extern "C" {
         const char * vad_model_path;              // Path to VAD model
 
         whisper_vad_params vad_params;
+
+        // Batched inference params
+        int         batch_size;                  // Number of parallel segments to process
     };
 
     // NOTE: this function allocates memory, and it is the responsibility of the caller to free the pointer - see whisper_free_context_params & whisper_free_params()
@@ -613,7 +616,7 @@ extern "C" {
                            const float * samples,
                                    int   n_samples);
 
-    // Split the input audio in chunks and process each chunk separately using whisper_full_with_state()
+// Split the input audio in chunks and process each chunk separately using whisper_full_with_state()
     // Result is stored in the default state of the context
     // Not thread safe if executed in parallel on the same context.
     // It seems this approach can offer some speedup in some cases.
@@ -624,6 +627,16 @@ extern "C" {
                            const float * samples,
                                    int   n_samples,
                                    int   n_processors);
+
+    // Batched inference - processes multiple audio segments in parallel using batch_size parameter
+    // Uses VAD to split audio into segments, then processes batch_size segments simultaneously
+    // Result is stored in the default state of the context
+    WHISPER_API int whisper_full_batched(
+                struct whisper_context * ctx,
+            struct whisper_full_params   params,
+                           const float * samples,
+                                   int   n_samples,
+                                   int   batch_size);
 
     // Number of generated text segments
     // A segment can be a few words, a sentence, or even a paragraph.

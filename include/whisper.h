@@ -625,6 +625,25 @@ extern "C" {
                                    int   n_samples,
                                    int   n_processors);
 
+    // Batched inference: transcribe the audio in groups of up to n_batch VAD segments,
+    // running one batched encoder pass and a lockstep greedy decoder loop per group.
+    // Result is stored in the default state of the context.
+    //
+    // Requirements (otherwise this falls back to whisper_full()):
+    //   - n_batch >= 2
+    //   - params.vad == true (Silero VAD provides the segment boundaries)
+    //   - params.flash_attn == true
+    //   - greedy sampling (best_of == 1, beam_size == 1)
+    //   - an explicit language (params.language, not "auto")
+    // The batched path decodes without timestamps (params.no_timestamps is forced on)
+    // and is not thread safe for the same context.
+    WHISPER_API int whisper_full_batched(
+                struct whisper_context * ctx,
+            struct whisper_full_params   params,
+                           const float * samples,
+                                   int   n_samples,
+                                   int   n_batch);
+
     // Number of generated text segments
     // A segment can be a few words, a sentence, or even a paragraph.
     WHISPER_API int whisper_full_n_segments           (struct whisper_context * ctx);

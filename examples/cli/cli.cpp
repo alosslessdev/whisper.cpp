@@ -44,6 +44,7 @@ struct whisper_params {
     int32_t best_of       = whisper_full_default_params(WHISPER_SAMPLING_GREEDY).greedy.best_of;
     int32_t beam_size     = whisper_full_default_params(WHISPER_SAMPLING_BEAM_SEARCH).beam_search.beam_size;
     int32_t audio_ctx     = 0;
+    int32_t batch_size    = 0; // > 1 enables whisper_full_batched() (requires --vad, greedy)
 
     float word_thold      =  0.01f;
     float entropy_thold   =  2.40f;
@@ -105,7 +106,7 @@ struct whisper_params {
 
     // Voice Activity Detection (VAD) parameters
     bool        vad           = false;
-    std::string vad_model     = "";
+    std::string vad_model     = "models/ggml-silero-v5.1.2.bin";
     float       vad_threshold = 0.5f;
     int         vad_min_speech_duration_ms = 250;
     int         vad_min_silence_duration_ms = 100;
@@ -166,6 +167,7 @@ static bool whisper_params_parse(int argc, char ** argv, whisper_params & params
         else if (arg == "-bo"   || arg == "--best-of")              { params.best_of         = std::stoi(ARGV_NEXT); }
         else if (arg == "-bs"   || arg == "--beam-size")            { params.beam_size       = std::stoi(ARGV_NEXT); }
         else if (arg == "-ac"   || arg == "--audio-ctx")            { params.audio_ctx       = std::stoi(ARGV_NEXT); }
+        else if (arg == "-bsz"  || arg == "--batch-size")           { params.batch_size      = std::stoi(ARGV_NEXT); }
         else if (arg == "-wt"   || arg == "--word-thold")           { params.word_thold      = std::stof(ARGV_NEXT); }
         else if (arg == "-et"   || arg == "--entropy-thold")        { params.entropy_thold   = std::stof(ARGV_NEXT); }
         else if (arg == "-lpt"  || arg == "--logprob-thold")        { params.logprob_thold   = std::stof(ARGV_NEXT); }
@@ -250,6 +252,7 @@ static void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params
     fprintf(stderr, "  -bo N,     --best-of N            [%-7d] number of best candidates to keep\n",              params.best_of);
     fprintf(stderr, "  -bs N,     --beam-size N          [%-7d] beam size for beam search\n",                      params.beam_size);
     fprintf(stderr, "  -ac N,     --audio-ctx N          [%-7d] audio context size (0 - all)\n",                   params.audio_ctx);
+    fprintf(stderr, "  -bsz N,    --batch-size N         [%-7d] batch size for batched inference (> 1 enables it; requires --vad, greedy)\n", params.batch_size);
     fprintf(stderr, "  -wt N,     --word-thold N         [%-7.2f] word timestamp probability threshold\n",         params.word_thold);
     fprintf(stderr, "  -et N,     --entropy-thold N      [%-7.2f] entropy threshold for decoder fail\n",           params.entropy_thold);
     fprintf(stderr, "  -lpt N,    --logprob-thold N      [%-7.2f] log probability threshold for decoder fail\n",   params.logprob_thold);
@@ -1329,7 +1332,20 @@ int main(int argc, char ** argv) {
                 wparams.abort_callback_user_data = &is_aborted;
             }
 
-            if (whisper_full_parallel(ctx, wparams, pcmf32.data(), pcmf32.size(), params.n_processors) != 0) {
+            int ret;
+            if (params.batch_size > 0) {
+                // batched inference: greedy-only, requires VAD
+                wparams.strategy              = WHISPER_SAMPLING_GREEDY;
+                wparams.greedy.best_of        = 1;
+                wparams.beam_search.beam_size = 1;
+                wparams.temperature_inc       = 0.0f;
+
+                ret = whisper_full_batched(ctx, wparams, pcmf32.data(), pcmf32.size(), params.batch_size);
+            } else {
+                ret = whisper_full_parallel(ctx, wparams, pcmf32.data(), pcmf32.size(), params.n_processors);
+            }
+
+            if (ret != 0) {
                 fprintf(stderr, "%s: failed to process audio\n", argv[0]);
                 whisper_free(ctx);
                 return 10;

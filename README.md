@@ -1,5 +1,28 @@
 # whisper.cpp
 
+Whisper.cpp with batched decoding. This makes whisper cpp as fast as whisper-ctranslate 2 according to internal tests, while retaining whisper.cpp's portability. 
+
+Adds a batched transcription path that runs a group of VAD segments through one encoder pass and a lockstep greedy decoder loop, matching the batched pipeline used by faster-whisper / whisper-ctranslate2.
+
+Implementation: batched conv/encoder/cross graph builders carry the batch in ne[2]; the decoder uses a 4-D flash cross-attention with the batch in ne[3] and decodes all lanes in lockstep (one shared prompt per lane, finished lanes fed <|eot|>). kv_self/kv_pad/kv_cross and the four schedulers are resized lazily. The sequence-batch machinery (whisper_batch.seq_id, kv cell seq_id, KQ mask) was already present for beam search and is reused.
+
+Scope: greedy only (best_of/beam_size must be 1), forces params.no_timestamps, no temperature fallback and no DTW. Falls back to whisper_full() with a warning when VAD, flash attention, an explicit language or greedy sampling is not configured.
+
+Also fixes and optimisations applied on top:
+- whisper_vad_segments_from_probs(): the 200 ms gap merge re-joined the segments produced by max_speech_duration_s splitting, so --vad-max-speech-duration-s had no effect (observed 57 s chunks with -vmsd 1). The merge now also requires merged_len <= max_speech_samples.
+- length-sorted batching: segments are grouped by duration and the results re-sorted chronologically, because a lockstep group costs as many steps as its longest lane.
+- per-lane sampling is fanned out over threads; the per-token full-vocabulary log-softmax was CPU bound and dominated batched decoding.
+- constant suppression token sets (language and non-speech tokens) are cached instead of doing ~360 std::map<std::string> lookups per generated token.
+- VAD stays on 4 CPU threads (measured optimum: 13.7 s at 4 vs 19.1 s at 12 for a 2 h file); the GPU VAD path remains disabled upstream.
+- env-gated diagnostics: WHISPER_BATCH_SELFTEST (encoder equivalence) and WHISPER_BATCH_DEBUG (phase timings).
+
+Measured on a 7605 s file (RTX 3060 6 GB, greedy, VAD):
+  large-v3 B6:  518 s -> 163 s (14.7x -> 46.7x realtime); whisper-ctranslate2 batched: 210 s
+  small B24:    151 s ->  45 s (50.4x -> 168.6x); whisper-ctranslate2 batched: 62 s
+  tiny.en B76:   51 s ->  27 s (148x -> 280x);    whisper-ctranslate2 batched: 31 s
+Word agreement with whisper-ctranslate2 output: 95 percent (large-v3), 94 percent (tiny.en).
+
+
 <div align="center">
 
 ![whisper.cpp](https://user-images.githubusercontent.com/1991296/235238348-05d0f6a4-da44-4900-a1de-d0707e75b763.jpeg)

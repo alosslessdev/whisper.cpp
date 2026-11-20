@@ -54,6 +54,8 @@ add_library(${TARGET} STATIC
     common-ggml.cpp
     common-whisper.h
     common-whisper.cpp
+    stream-audio.h
+    stream-audio.cpp
     grammar-parser.h
     grammar-parser.cpp
     ${COMMON_SOURCES_FFMPEG}

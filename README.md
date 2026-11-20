@@ -22,6 +22,33 @@ Measured on a 7605 s file (RTX 3060 6 GB, greedy, VAD):
   tiny.en B76:   51 s ->  27 s (148x -> 280x);    whisper-ctranslate2 batched: 31 s
 Word agreement with whisper-ctranslate2 output: 95 percent (large-v3), 94 percent (tiny.en).
 
+Streaming from disk (`--stream`):
+```
+./build/bin/whisper-cli -m models/ggml-large-v3.bin -f input.mp3 --batch-size 6 --stream
+```
+The encoded file is decoded and resampled to 16 kHz mono f32 on a worker thread while
+the GPU decodes the previous groups (libav, no intermediate WAV and no full-file PCM
+array). The same worker runs Silero VAD incrementally with the LSTM state carried across
+blocks, so completed speech segments are batched as they are produced and transcoding /
+VAD never stall the decoder. RAM is bounded by the segments in flight (the segment queue
+and the batch pool, up to `4*N` speech segments) plus the 30 s decode window, independent
+of the file length; segments are capped at the 30 s encoder context.
+
+Only greedy decoding, flash attention, an explicit language and `--batch-size > 1` are
+supported, and the build must use `-DWHISPER_COMMON_FFMPEG=ON`. `WHISPER_STREAM_DEBUG=1`
+prints read/VAD/decode times and the fraction of wall time spent decoding; on a 730 s
+speech file the decode thread was busy 97.5% of the time (base.en, batch 12) vs 76% when
+VAD ran on the decode thread. The API is
+`whisper_full_stream()` (callback-driven, usable from bindings); the file reader lives in
+`examples/stream-audio.cpp`.
+
+Measured on a 7305 s mp3 (RTX 3060 6 GB, base.en, batch 12):
+  batch : 62.1 s, 1182 MB RSS
+  stream: 48.0 s,  666 MB RSS, decode thread busy 99.7% of wall time
+On lossless input (WAV) the stream and whole-file batched transcripts are identical; on
+mp3 99.9% of words match (libav and miniaudio decode the lossy stream slightly
+differently).
+
 
 <div align="center">
 

@@ -27,12 +27,15 @@
 #define _USE_MATH_DEFINES
 #include <cmath>
 #include <climits>
+#include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <random>
 #include <regex>
 #include <set>
@@ -9259,6 +9262,332 @@ static int whisper_batch_encoder_selftest(
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Batched decoding helpers.
+//
+// A group is a set of independent audio segments decoded together: one batched
+// conv/encoder/cross pass followed by a lockstep greedy decoder loop. Both
+// whisper_full_batched() (whole-file VAD) and whisper_full_stream() (incremental
+// VAD) drive this same group decoder, so identical segment boundaries produce
+// identical transcripts.
+// ---------------------------------------------------------------------------
+
+struct whisper_batch_lane {
+    bool          finished       = true;
+    whisper_token last           = 0;
+    float         no_speech_prob = 0.0f;
+    std::vector<whisper_token_data> tokens;
+};
+
+struct whisper_batch_view {
+    const float * samples   = nullptr;
+    int           n_samples = 0;
+    int64_t       t0        = 0; // stored in the resulting segment (centiseconds)
+    int64_t       t1        = 0;
+    int64_t       disp_t0   = 0; // used by print_realtime (can be the original timeline)
+    int64_t       disp_t1   = 0;
+};
+
+struct whisper_batch_workspace {
+    int n_batch  = 0;
+    int max_gen  = 0;
+    int n_prompt = 0;
+    int n_ctx    = 0;
+    int n_mels   = 0;
+    int n_vocab  = 0;
+
+    std::vector<float>              mel_batched;
+    std::vector<whisper_batch_lane> lanes;
+    std::vector<whisper_decoder>    decoders;
+    std::vector<whisper_token>      prompt_init;
+};
+
+// Allocate everything that is reused across groups and pre-compute the constant
+// prompt / suppression sets. state.exp_n_audio_ctx must already be set.
+static bool whisper_batch_workspace_init(
+        whisper_context & ctx,
+          whisper_state & state,
+    const whisper_full_params & params,
+                 int n_batch,
+                 int max_gen,
+    whisper_batch_workspace & ws) {
+    ws.n_batch = n_batch;
+    ws.max_gen = max_gen;
+    ws.n_ctx   = state.exp_n_audio_ctx > 0 ? state.exp_n_audio_ctx : ctx.model.hparams.n_audio_ctx;
+    ws.n_mels  = ctx.model.hparams.n_mels;
+    ws.n_vocab = ctx.vocab.n_vocab;
+
+    ws.mel_batched.assign((size_t)(2*ws.n_ctx)*ws.n_mels*n_batch, 0.0f);
+
+    ws.lanes.assign(n_batch, whisper_batch_lane{});
+    ws.decoders.assign(n_batch, whisper_decoder{});
+    for (int b = 0; b < n_batch; ++b) {
+        ws.decoders[b].rng = std::mt19937(b);
+        ws.decoders[b].probs.reserve(ws.n_vocab);
+        ws.decoders[b].logits.reserve(ws.n_vocab);
+        ws.decoders[b].logprobs.reserve(ws.n_vocab);
+    }
+
+    // prompt: sot, language, task, notimestamps (identical for every sequence)
+    ws.prompt_init = { whisper_token_sot(&ctx), };
+    if (whisper_is_multilingual(&ctx)) {
+        const int lang_id = whisper_lang_id(params.language);
+        state.lang_id = lang_id;
+        ws.prompt_init.push_back(whisper_token_lang(&ctx, lang_id));
+        if (params.translate) {
+            ws.prompt_init.push_back(whisper_token_translate(&ctx));
+        } else {
+            ws.prompt_init.push_back(whisper_token_transcribe(&ctx));
+        }
+    }
+    ws.prompt_init.push_back(whisper_token_not(&ctx));
+    ws.n_prompt = (int) ws.prompt_init.size();
+
+    // Pre-compute the constant suppression sets once so the parallel per-lane sampling
+    // does not mutate shared state concurrently.
+    if (state.suppress_lang_ids.empty()) {
+        state.suppress_lang_ids.reserve(g_lang.size());
+        for (size_t i = 0; i < g_lang.size(); ++i) {
+            state.suppress_lang_ids.push_back(whisper_token_lang(&ctx, i));
+        }
+    }
+    if (params.suppress_nst && state.suppress_nst_ids.empty()) {
+        for (const std::string & token : non_speech_tokens) {
+            const std::string cand[] = { token, " " + token };
+            for (const std::string & c : cand) {
+                auto it = ctx.vocab.token_to_id.find(c);
+                if (it != ctx.vocab.token_to_id.end()) {
+                    state.suppress_nst_ids.push_back(it->second);
+                }
+            }
+        }
+        for (const char * c : { " -", " '" }) {
+            auto it = ctx.vocab.token_to_id.find(c);
+            if (it != ctx.vocab.token_to_id.end()) {
+                state.suppress_nst_ids.push_back(it->second);
+            }
+        }
+    }
+
+    return true;
+}
+
+struct whisper_batch_result {
+    whisper_segment segment;
+    int64_t         disp_t0 = 0;
+    int64_t         disp_t1 = 0;
+};
+
+// Decode up to nb segments (all lanes in lockstep) and append the non-empty results
+// to `out`, in the same order as `views`.
+static bool whisper_batch_decode_group(
+        whisper_context & ctx,
+          whisper_state & state,
+    const whisper_full_params & params,
+    whisper_batch_workspace & ws,
+    const whisper_batch_view * views,
+                 int nb,
+    std::vector<whisper_batch_result> & out) {
+    const int n_batch = ws.n_batch;
+    const int n_ctx   = ws.n_ctx;
+    const int n_mels  = ws.n_mels;
+    const int n_vocab = ws.n_vocab;
+    const int n_prompt = ws.n_prompt;
+
+    if (nb < 1 || nb > n_batch) {
+        WHISPER_LOG_ERROR("%s: invalid batch lane count %d (n_batch = %d)\n", __func__, nb, n_batch);
+        return false;
+    }
+
+    // build the batched mel input: [2*n_ctx, n_mels, n_batch]
+    std::fill(ws.mel_batched.begin(), ws.mel_batched.end(), 0.0f);
+    whisper_mel mel_tmp;
+    for (int b = 0; b < nb; ++b) {
+        const auto & v = views[b];
+        if (v.n_samples <= 0) {
+            continue;
+        }
+
+        if (!log_mel_spectrogram(state, v.samples, v.n_samples, WHISPER_SAMPLE_RATE, WHISPER_N_FFT, WHISPER_HOP_LENGTH, n_mels, params.n_threads, ctx.model.filters, false, mel_tmp)) {
+            WHISPER_LOG_ERROR("%s: failed to compute mel for lane %d\n", __func__, b);
+            return false;
+        }
+
+        const int n_copy = std::min(mel_tmp.n_len, 2*n_ctx);
+        for (int j = 0; j < n_mels; ++j) {
+            for (int i = 0; i < n_copy; ++i) {
+                ws.mel_batched[(size_t) i + (size_t) j*(2*n_ctx) + (size_t) b*(2*n_ctx)*n_mels] = mel_tmp.data[j*mel_tmp.n_len + i];
+            }
+        }
+    }
+
+    if (!whisper_encode_internal_batched(ctx, state, ws.mel_batched.data(), n_batch, params.n_threads, params.abort_callback, params.abort_callback_user_data)) {
+        WHISPER_LOG_ERROR("%s: failed to encode\n", __func__);
+        return false;
+    }
+
+    // reset per-lane state
+    for (int b = 0; b < n_batch; ++b) {
+        auto & L = ws.lanes[b];
+        L.finished       = (b >= nb);
+        L.last           = whisper_token_eot(&ctx);
+        L.no_speech_prob = 0.0f;
+        L.tokens.clear();
+
+        auto & dec = ws.decoders[b];
+        dec.sequence.tokens.clear();
+        dec.sequence.result_len = 0;
+        dec.failed    = false;
+        dec.completed = false;
+        dec.has_ts    = false;
+        dec.seek_delta = 100*WHISPER_CHUNK_SIZE;
+        dec.grammar   = {};
+    }
+
+    whisper_kv_cache_clear(state.kv_self);
+
+    auto & batch = state.batch;
+
+    // feed the prompt: one token per sequence per step, all positions equal
+    for (int p = 0; p < n_prompt; ++p) {
+        batch.n_tokens = n_batch;
+        for (int b = 0; b < n_batch; ++b) {
+            batch.token[b]     = ws.lanes[b].finished ? whisper_token_eot(&ctx) : ws.prompt_init[p];
+            batch.pos[b]       = p;
+            batch.n_seq_id[b]  = 1;
+            batch.seq_id[b][0] = b;
+            batch.logits[b]    = (p == n_prompt - 1) ? 1 : 0;
+        }
+        if (!whisper_decode_internal_batched(ctx, state, batch, params.n_threads, false, params.abort_callback, params.abort_callback_user_data)) {
+            WHISPER_LOG_ERROR("%s: failed to decode prompt\n", __func__);
+            return false;
+        }
+    }
+
+    // lockstep greedy generation
+    for (int gen = 0; gen < ws.max_gen; ++gen) {
+        bool all_done = true;
+        for (int b = 0; b < nb; ++b) {
+            if (!ws.lanes[b].finished) {
+                all_done = false;
+                break;
+            }
+        }
+        if (all_done) {
+            break;
+        }
+
+        batch.n_tokens = n_batch;
+        for (int b = 0; b < n_batch; ++b) {
+            batch.token[b]     = ws.lanes[b].finished ? whisper_token_eot(&ctx) : ws.lanes[b].last;
+            batch.pos[b]       = n_prompt + gen;
+            batch.n_seq_id[b]  = 1;
+            batch.seq_id[b][0] = b;
+            batch.logits[b]    = ws.lanes[b].finished ? 0 : 1;
+        }
+
+        if (!whisper_decode_internal_batched(ctx, state, batch, params.n_threads, false, params.abort_callback, params.abort_callback_user_data)) {
+            WHISPER_LOG_ERROR("%s: failed to decode\n", __func__);
+            return false;
+        }
+
+        // Sample one token per active lane. This is CPU bound (a full-vocabulary
+        // log-softmax per lane per token) and dominates batched decoding, so fan the
+        // lanes out over threads once there are enough of them.
+        auto sample_lane = [&](int b) {
+            auto & L = ws.lanes[b];
+            if (L.finished) {
+                return;
+            }
+
+            auto & dec = ws.decoders[b];
+            dec.i_batch = b;
+
+            // no_speech probability from the raw logits of the first generated token
+            if (gen == 0) {
+                const float * row = state.logits.data() + (size_t) b*n_vocab;
+                float mx = -INFINITY;
+                for (int i = 0; i < n_vocab; ++i) {
+                    mx = std::max(mx, row[i]);
+                }
+                float sum = 0.0f;
+                for (int i = 0; i < n_vocab; ++i) {
+                    sum += expf(row[i] - mx);
+                }
+                L.no_speech_prob = expf(row[whisper_token_nosp(&ctx)] - mx)/sum;
+            }
+
+            whisper_process_logits(ctx, state, dec, params, 0.0f);
+
+            const whisper_token_data tok = whisper_sample_token(ctx, dec, true);
+
+            if (tok.id == whisper_token_eot(&ctx)) {
+                L.finished = true;
+            } else {
+                dec.sequence.tokens.push_back(tok);
+                L.tokens.push_back(tok);
+                L.last = tok.id;
+            }
+        };
+
+        if (nb >= 4 && params.n_threads > 1) {
+            const int n_th = std::min(nb, params.n_threads);
+            std::vector<std::thread> th;
+            th.reserve(n_th - 1);
+            for (int t = 1; t < n_th; ++t) {
+                th.emplace_back([&sample_lane, nb, n_th, t]() {
+                    for (int b = t; b < nb; b += n_th) {
+                        sample_lane(b);
+                    }
+                });
+            }
+            for (int b = 0; b < nb; b += n_th) {
+                sample_lane(b);
+            }
+            for (auto & x : th) {
+                x.join();
+            }
+        } else {
+            for (int b = 0; b < nb; ++b) {
+                sample_lane(b);
+            }
+        }
+    }
+
+    // emit the segments of this group, in lane order
+    out.clear();
+    out.reserve(nb);
+    for (int b = 0; b < nb; ++b) {
+        auto & L = ws.lanes[b];
+
+        std::string text;
+        for (const auto & t : L.tokens) {
+            if (params.print_special || t.id < whisper_token_eot(&ctx)) {
+                text += whisper_token_to_str(&ctx, t.id);
+            }
+        }
+
+        if (text.empty()) {
+            continue;
+        }
+
+        whisper_batch_result res;
+        whisper_segment & seg = res.segment;
+        seg.t0               = views[b].t0;
+        seg.t1               = views[b].t1;
+        seg.text             = std::move(text);
+        seg.no_speech_prob   = L.no_speech_prob;
+        seg.speaker_turn_next = false;
+        seg.tokens           = L.tokens;
+        res.disp_t0          = views[b].disp_t0;
+        res.disp_t1          = views[b].disp_t1;
+
+        out.push_back(std::move(res));
+    }
+
+    return true;
+}
+
 // Batched inference driver.
 //
 // Transcribes the audio in groups of up to n_batch VAD segments: one batched
@@ -9384,72 +9713,10 @@ int whisper_full_batched(
                 (t_dbg_vad1 - t_dbg_vad0)/1e6, (t_dbg_prep1 - t_dbg_prep0)/1e6);
     }
 
-    const int n_ctx   = state.exp_n_audio_ctx > 0 ? state.exp_n_audio_ctx : ctx->model.hparams.n_audio_ctx;
-    const int n_mels  = ctx->model.hparams.n_mels;
-    const int n_vocab = ctx->vocab.n_vocab;
-
-    // prompt: sot, language, task, notimestamps (identical for every sequence)
-    std::vector<whisper_token> prompt_init = { whisper_token_sot(ctx), };
-    if (whisper_is_multilingual(ctx)) {
-        const int lang_id = whisper_lang_id(params.language);
-        state.lang_id = lang_id;
-        prompt_init.push_back(whisper_token_lang(ctx, lang_id));
-        if (params.translate) {
-            prompt_init.push_back(whisper_token_translate(ctx));
-        } else {
-            prompt_init.push_back(whisper_token_transcribe(ctx));
-        }
-    }
-    prompt_init.push_back(whisper_token_not(ctx));
-
-    const int n_prompt = (int) prompt_init.size();
-
-    struct lane_t {
-        bool finished = true;
-        whisper_token last = 0;
-        float no_speech_prob = 0.0f;
-        std::vector<whisper_token_data> tokens;
-    };
-
-    std::vector<lane_t>        lanes(n_batch);
-    std::vector<whisper_decoder> decoders(n_batch);
-
-    for (int b = 0; b < n_batch; ++b) {
-        decoders[b].rng = std::mt19937(b);
-        decoders[b].probs.reserve(n_vocab);
-        decoders[b].logits.reserve(n_vocab);
-        decoders[b].logprobs.reserve(n_vocab);
-    }
-
-    std::vector<float> mel_batched((size_t)(2*n_ctx)*n_mels*n_batch);
-    whisper_mel mel_tmp;
-
-    auto & batch = state.batch;
-
-    // Pre-compute the constant suppression sets once so the parallel per-lane sampling
-    // below does not mutate shared state concurrently.
-    if (state.suppress_lang_ids.empty()) {
-        state.suppress_lang_ids.reserve(g_lang.size());
-        for (size_t i = 0; i < g_lang.size(); ++i) {
-            state.suppress_lang_ids.push_back(whisper_token_lang(ctx, i));
-        }
-    }
-    if (params.suppress_nst && state.suppress_nst_ids.empty()) {
-        for (const std::string & token : non_speech_tokens) {
-            const std::string cand[] = { token, " " + token };
-            for (const std::string & c : cand) {
-                auto it = ctx->vocab.token_to_id.find(c);
-                if (it != ctx->vocab.token_to_id.end()) {
-                    state.suppress_nst_ids.push_back(it->second);
-                }
-            }
-        }
-        for (const char * c : { " -", " '" }) {
-            auto it = ctx->vocab.token_to_id.find(c);
-            if (it != ctx->vocab.token_to_id.end()) {
-                state.suppress_nst_ids.push_back(it->second);
-            }
-        }
+    whisper_batch_workspace ws;
+    if (!whisper_batch_workspace_init(*ctx, state, params, n_batch, max_gen, ws)) {
+        WHISPER_LOG_ERROR("%s: failed to initialize the batched workspace\n", __func__);
+        return -1;
     }
 
     for (int seg0 = 0; seg0 < n_segments; seg0 += n_batch) {
@@ -9459,8 +9726,7 @@ int whisper_full_batched(
             params.progress_callback(ctx, &state, (100*seg0)/n_segments, params.progress_callback_user_data);
         }
 
-        // build the batched mel input: [2*n_ctx, n_mels, n_batch]
-        std::fill(mel_batched.begin(), mel_batched.end(), 0.0f);
+        std::vector<whisper_batch_view> views(nb);
         for (int b = 0; b < nb; ++b) {
             const auto & seg = state.vad_segments[order[seg0 + b]];
 
@@ -9468,190 +9734,34 @@ int whisper_full_batched(
             int64_t s1 = (seg.orig_end   * WHISPER_SAMPLE_RATE) / 100;
             s0 = std::max<int64_t>(0, std::min<int64_t>(s0, n_samples));
             s1 = std::max<int64_t>(s0, std::min<int64_t>(s1, n_samples));
-            if (s1 <= s0) {
-                continue;
-            }
 
-            if (!log_mel_spectrogram(state, samples + s0, (int)(s1 - s0), WHISPER_SAMPLE_RATE, WHISPER_N_FFT, WHISPER_HOP_LENGTH, n_mels, params.n_threads, ctx->model.filters, false, mel_tmp)) {
-                WHISPER_LOG_ERROR("%s: failed to compute mel for segment %d\n", __func__, seg0 + b);
-                return -1;
-            }
-
-            const int n_copy = std::min(mel_tmp.n_len, 2*n_ctx);
-            for (int j = 0; j < n_mels; ++j) {
-                for (int i = 0; i < n_copy; ++i) {
-                    mel_batched[(size_t) i + (size_t) j*(2*n_ctx) + (size_t) b*(2*n_ctx)*n_mels] = mel_tmp.data[j*mel_tmp.n_len + i];
-                }
-            }
+            views[b].samples   = samples + s0;
+            views[b].n_samples = (int)(s1 - s0);
+            // result_all stores times in the VAD ("processed") timeline; the public
+            // getters map them back to the original timeline via vad_mapping_table
+            views[b].t0        = seg.vad_start;
+            views[b].t1        = seg.vad_end;
+            views[b].disp_t0   = seg.orig_start;
+            views[b].disp_t1   = seg.orig_end;
         }
 
-        if (!whisper_encode_internal_batched(*ctx, state, mel_batched.data(), n_batch, params.n_threads, params.abort_callback, params.abort_callback_user_data)) {
-            WHISPER_LOG_ERROR("%s: failed to encode\n", __func__);
+        std::vector<whisper_batch_result> group;
+        if (!whisper_batch_decode_group(*ctx, state, params, ws, views.data(), nb, group)) {
+            WHISPER_LOG_ERROR("%s: failed to decode batch\n", __func__);
             return -6;
         }
 
-        // reset per-lane state
-        for (int b = 0; b < n_batch; ++b) {
-            auto & L = lanes[b];
-            L.finished       = (b >= nb);
-            L.last           = whisper_token_eot(ctx);
-            L.no_speech_prob = 0.0f;
-            L.tokens.clear();
-
-            auto & dec = decoders[b];
-            dec.sequence.tokens.clear();
-            dec.sequence.result_len = 0;
-            dec.failed    = false;
-            dec.completed = false;
-            dec.has_ts    = false;
-            dec.seek_delta = 100*WHISPER_CHUNK_SIZE;
-            dec.grammar   = {};
-        }
-
-        whisper_kv_cache_clear(state.kv_self);
-
-        // feed the prompt: one token per sequence per step, all positions equal
-        for (int p = 0; p < n_prompt; ++p) {
-            batch.n_tokens = n_batch;
-            for (int b = 0; b < n_batch; ++b) {
-                batch.token[b]     = lanes[b].finished ? whisper_token_eot(ctx) : prompt_init[p];
-                batch.pos[b]       = p;
-                batch.n_seq_id[b]  = 1;
-                batch.seq_id[b][0] = b;
-                batch.logits[b]    = (p == n_prompt - 1) ? 1 : 0;
-            }
-            if (!whisper_decode_internal_batched(*ctx, state, batch, params.n_threads, false, params.abort_callback, params.abort_callback_user_data)) {
-                WHISPER_LOG_ERROR("%s: failed to decode prompt\n", __func__);
-                return -8;
-            }
-        }
-
-        // lockstep greedy generation
-        for (int gen = 0; gen < max_gen; ++gen) {
-            bool all_done = true;
-            for (int b = 0; b < nb; ++b) {
-                if (!lanes[b].finished) {
-                    all_done = false;
-                    break;
-                }
-            }
-            if (all_done) {
-                break;
-            }
-
-            batch.n_tokens = n_batch;
-            for (int b = 0; b < n_batch; ++b) {
-                batch.token[b]     = lanes[b].finished ? whisper_token_eot(ctx) : lanes[b].last;
-                batch.pos[b]       = n_prompt + gen;
-                batch.n_seq_id[b]  = 1;
-                batch.seq_id[b][0] = b;
-                batch.logits[b]    = lanes[b].finished ? 0 : 1;
-            }
-
-            if (!whisper_decode_internal_batched(*ctx, state, batch, params.n_threads, false, params.abort_callback, params.abort_callback_user_data)) {
-                WHISPER_LOG_ERROR("%s: failed to decode\n", __func__);
-                return -8;
-            }
-
-            // Sample one token per active lane. This is CPU bound (a full-vocabulary
-            // log-softmax per lane per token) and dominates batched decoding, so fan the
-            // lanes out over threads once there are enough of them.
-            auto sample_lane = [&](int b) {
-                auto & L = lanes[b];
-                if (L.finished) {
-                    return;
-                }
-
-                auto & dec = decoders[b];
-                dec.i_batch = b;
-
-                // no_speech probability from the raw logits of the first generated token
-                if (gen == 0) {
-                    const float * row = state.logits.data() + (size_t) b*n_vocab;
-                    float mx = -INFINITY;
-                    for (int i = 0; i < n_vocab; ++i) {
-                        mx = std::max(mx, row[i]);
-                    }
-                    float sum = 0.0f;
-                    for (int i = 0; i < n_vocab; ++i) {
-                        sum += expf(row[i] - mx);
-                    }
-                    L.no_speech_prob = expf(row[whisper_token_nosp(ctx)] - mx)/sum;
-                }
-
-                whisper_process_logits(*ctx, state, dec, params, 0.0f);
-
-                const whisper_token_data tok = whisper_sample_token(*ctx, dec, true);
-
-                if (tok.id == whisper_token_eot(ctx)) {
-                    L.finished = true;
-                } else {
-                    dec.sequence.tokens.push_back(tok);
-                    L.tokens.push_back(tok);
-                    L.last = tok.id;
-                }
-            };
-
-            if (nb >= 4 && params.n_threads > 1) {
-                const int n_th = std::min(nb, params.n_threads);
-                std::vector<std::thread> th;
-                th.reserve(n_th - 1);
-                for (int t = 1; t < n_th; ++t) {
-                    th.emplace_back([&sample_lane, nb, n_th, t]() {
-                        for (int b = t; b < nb; b += n_th) {
-                            sample_lane(b);
-                        }
-                    });
-                }
-                for (int b = 0; b < nb; b += n_th) {
-                    sample_lane(b);
-                }
-                for (auto & x : th) {
-                    x.join();
-                }
-            } else {
-                for (int b = 0; b < nb; ++b) {
-                    sample_lane(b);
-                }
-            }
-        }
-
-        // emit the segments of this group
-        for (int b = 0; b < nb; ++b) {
-            auto & L = lanes[b];
-            const auto & seg = state.vad_segments[order[seg0 + b]];
-
-            std::string text;
-            for (const auto & t : L.tokens) {
-                if (params.print_special || t.id < whisper_token_eot(ctx)) {
-                    text += whisper_token_to_str(ctx, t.id);
-                }
-            }
-
+        for (auto & res : group) {
             if (params.print_realtime) {
                 if (params.print_timestamps) {
-                    printf("[%s --> %s]  %s\n", to_timestamp(seg.orig_start).c_str(), to_timestamp(seg.orig_end).c_str(), text.c_str());
+                    printf("[%s --> %s]  %s\n", to_timestamp(res.disp_t0).c_str(), to_timestamp(res.disp_t1).c_str(), res.segment.text.c_str());
                 } else {
-                    printf("%s", text.c_str());
+                    printf("%s", res.segment.text.c_str());
                     fflush(stdout);
                 }
             }
 
-            if (text.empty()) {
-                continue;
-            }
-
-            whisper_segment out;
-            // result_all stores times in the VAD ("processed") timeline; the public
-            // getters map them back to the original timeline via vad_mapping_table
-            out.t0               = seg.vad_start;
-            out.t1               = seg.vad_end;
-            out.text             = text;
-            out.no_speech_prob   = L.no_speech_prob;
-            out.speaker_turn_next = false;
-            out.tokens           = L.tokens;
-
-            state.result_all.push_back(std::move(out));
+            state.result_all.push_back(std::move(res.segment));
 
             if (params.new_segment_callback) {
                 params.new_segment_callback(ctx, &state, 1, params.new_segment_callback_user_data);
@@ -9669,6 +9779,707 @@ int whisper_full_batched(
 
     return 0;
 }
+
+// ---------------------------------------------------------------------------
+// Incremental VAD segmentation.
+//
+// whisper_vad_segments_from_probs() runs the Silero probability -> speech segment
+// state machine over a complete probability array. Streaming needs the same logic
+// applied one probability at a time, emitting segments as soon as their boundaries
+// are known. This reproduces the whole-file state machine, merge, minimum-duration
+// and padding rules; the only difference is that padding can only look forward, so
+// a segment is emitted once the following segment has started (or 200 ms of
+// non-speech have been observed).
+// ---------------------------------------------------------------------------
+struct whisper_stream_segment {
+    int64_t start; // samples, on the original timeline
+    int64_t end;
+};
+
+struct whisper_vad_stream_segmenter {
+    struct raw_segment {
+        int64_t start;
+        int64_t end;
+    };
+
+    int     n_window            = 0;
+    float   threshold           = 0.5f;
+    float   neg_threshold       = 0.35f;
+    int64_t min_speech_samples  = 0;
+    int64_t min_silence_samples = 0;
+    int64_t speech_pad_samples  = 0;
+    int64_t max_speech_samples  = 0;
+    int64_t min_silence_samples_at_max_speech = 0;
+    int64_t max_merge_gap_samples = 0;
+
+    // state machine (same variables as whisper_vad_segments_from_probs)
+    bool    is_speech_segment = false;
+    bool    has_curr_speech   = false;
+    int64_t curr_speech_start = 0;
+    int64_t temp_end          = 0;
+    int64_t prev_end          = 0;
+    int64_t next_start        = 0;
+    int64_t n_probs           = 0;
+
+    std::deque<raw_segment> raw;
+    int64_t front_start = -1; // padded start of raw.front(), -1 = it is the first segment
+
+    void init(const whisper_vad_params & p, int n_window_) {
+        n_window    = n_window_;
+        threshold   = p.threshold;
+        neg_threshold = threshold - 0.15f;
+        if (neg_threshold < 0.01f) {
+            neg_threshold = 0.01f;
+        }
+
+        min_speech_samples  = WHISPER_SAMPLE_RATE * p.min_speech_duration_ms / 1000;
+        min_silence_samples = WHISPER_SAMPLE_RATE * p.min_silence_duration_ms / 1000;
+        speech_pad_samples  = WHISPER_SAMPLE_RATE * p.speech_pad_ms / 1000;
+        max_merge_gap_samples = WHISPER_SAMPLE_RATE * 200 / 1000;
+        min_silence_samples_at_max_speech = WHISPER_SAMPLE_RATE * 98 / 1000;
+
+        // Streaming caps segments at the 30 s encoder context. Without the cap a
+        // single long VAD segment would be retained in RAM and decoded as one lane,
+        // which defeats both the memory bound and the batching. A non-positive or
+        // huge value means "no limit" in the whole-file path; apply the 30 s cap here.
+        const float max_speech_s = (p.max_speech_duration_s > 0.0f && p.max_speech_duration_s < 30.0f)
+                                 ? p.max_speech_duration_s : 30.0f;
+        int64_t temp = (int64_t) WHISPER_SAMPLE_RATE * (int64_t) max_speech_s - n_window - 2*speech_pad_samples;
+        if (temp < n_window) {
+            // never allow an unbounded segment in streaming mode
+            temp = std::max<int64_t>(n_window, (int64_t) WHISPER_SAMPLE_RATE * 30 - n_window - 2*speech_pad_samples);
+        }
+        max_speech_samples = temp;
+    }
+
+    void push_raw(int64_t start, int64_t end) {
+        raw.push_back({ start, end });
+
+        // Same 200 ms gap merge as the whole-file path, but it must not re-join the
+        // contiguous segments produced by max_speech_duration splitting.
+        while (raw.size() >= 2) {
+            raw_segment & a = raw[raw.size() - 2];
+            const raw_segment & b = raw.back();
+            const int64_t gap    = b.start - a.end;
+            const int64_t merged = b.end - a.start;
+            if (gap < max_merge_gap_samples && merged <= max_speech_samples) {
+                a.end = b.end;
+                raw.pop_back();
+            } else {
+                break;
+            }
+        }
+    }
+
+    void feed(float prob) {
+        const int64_t curr_sample = n_probs * n_window;
+        ++n_probs;
+
+        // Reset temp_end when we get back to speech
+        if ((prob >= threshold) && temp_end) {
+            temp_end = 0;
+            if (next_start < prev_end) {
+                next_start = curr_sample;
+            }
+        }
+
+        // Start a new speech segment
+        if ((prob >= threshold) && !is_speech_segment) {
+            is_speech_segment = true;
+            curr_speech_start = curr_sample;
+            has_curr_speech   = true;
+            return;
+        }
+
+        // Handle maximum speech duration
+        if (is_speech_segment && (curr_sample - curr_speech_start) > max_speech_samples) {
+            if (prev_end) {
+                push_raw(curr_speech_start, prev_end);
+                has_curr_speech = true;
+
+                if (next_start < prev_end) {
+                    is_speech_segment = false;
+                    has_curr_speech   = false;
+                } else {
+                    curr_speech_start = next_start;
+                }
+                prev_end = next_start = temp_end = 0;
+            } else {
+                push_raw(curr_speech_start, curr_sample);
+                prev_end = next_start = temp_end = 0;
+                is_speech_segment = false;
+                has_curr_speech   = false;
+                return;
+            }
+        }
+
+        // Handle silence after speech
+        if ((prob < neg_threshold) && is_speech_segment) {
+            if (!temp_end) {
+                temp_end = curr_sample;
+            }
+
+            if ((curr_sample - temp_end) > min_silence_samples_at_max_speech) {
+                prev_end = temp_end;
+            }
+
+            if ((curr_sample - temp_end) < min_silence_samples) {
+                return;
+            }
+
+            if ((temp_end - curr_speech_start) > min_speech_samples) {
+                push_raw(curr_speech_start, temp_end);
+            }
+
+            prev_end = next_start = temp_end = 0;
+            is_speech_segment = false;
+            has_curr_speech   = false;
+        }
+    }
+
+    void emit_one(bool last, int64_t audio_end, std::vector<whisper_stream_segment> & out) {
+        raw_segment s = raw.front();
+
+        int64_t start = front_start >= 0 ? front_start : std::max<int64_t>(0, s.start - speech_pad_samples);
+        int64_t end   = s.end;
+        int64_t next_front = -1;
+
+        if (!last) {
+            const raw_segment & n = raw[1];
+            const int64_t gap = n.start - end;
+            if (gap < 2*speech_pad_samples) {
+                end += gap/2;
+                next_front = n.start - gap/2;
+            } else {
+                end += speech_pad_samples;
+                next_front = n.start - speech_pad_samples;
+            }
+            if (next_front < 0) {
+                next_front = 0;
+            }
+        } else {
+            end += speech_pad_samples;
+            if (audio_end >= 0 && end > audio_end) {
+                end = audio_end;
+            }
+        }
+
+        if (end < start) {
+            end = start;
+        }
+
+        out.push_back({ start, end });
+        raw.pop_front();
+        front_start = last ? -1 : next_front;
+    }
+
+    // Emit every segment whose boundaries can no longer change.
+    void poll(int64_t n_seen, std::vector<whisper_stream_segment> & out) {
+        // shorter than min_speech_duration_ms: the whole-file pass drops these
+        while (raw.size() >= 2 && (raw.front().end - raw.front().start) < min_speech_samples) {
+            raw.pop_front();
+            front_start = -1;
+        }
+        while (raw.size() >= 3 && (raw[1].end - raw[1].start) < min_speech_samples) {
+            raw.erase(raw.begin() + 1);
+        }
+
+        while (raw.size() >= 2) {
+            emit_one(false, -1, out);
+        }
+
+        // A single trailing segment: once 200 ms of non-speech have been observed its
+        // end padding is fixed (the next segment cannot be merged with it anymore).
+        if (raw.size() == 1 && !is_speech_segment &&
+            n_seen >= raw.front().end + max_merge_gap_samples + n_window) {
+            emit_one(true, -1, out);
+        }
+    }
+
+    void flush(int64_t audio_end, std::vector<whisper_stream_segment> & out) {
+        if (has_curr_speech && (audio_end - curr_speech_start) > min_speech_samples) {
+            push_raw(curr_speech_start, audio_end);
+            is_speech_segment = false;
+            has_curr_speech   = false;
+        }
+
+        poll(audio_end, out);
+
+        if (!raw.empty()) {
+            if ((raw.front().end - raw.front().start) < min_speech_samples) {
+                raw.pop_front();
+                front_start = -1;
+            } else {
+                emit_one(true, audio_end, out);
+            }
+        }
+    }
+
+    // Earliest sample that may still be needed by a future segment. vad_start is
+    // the first sample of the oldest VAD window that has not been classified yet:
+    // a future speech segment can begin there, so it must stay buffered too.
+    int64_t retain_from(int64_t n_seen, int64_t vad_start) const {
+        int64_t need = std::max<int64_t>(0, vad_start - speech_pad_samples - n_window);
+        if (!raw.empty()) {
+            need = std::min(need, raw.front().start - speech_pad_samples);
+            if (front_start >= 0) {
+                need = std::min(need, front_start);
+            }
+        }
+        if (is_speech_segment) {
+            need = std::min(need, curr_speech_start - speech_pad_samples);
+        }
+        // Segment boundaries are emitted in centiseconds and converted back to
+        // samples (same as the whole-file path); rounding can move a slice up to
+        // ~1 cs earlier than the exact padded start.
+        if (need < n_seen) {
+            need -= n_window;
+        }
+        return std::max<int64_t>(0, need);
+    }
+};
+
+struct whisper_stream_pool_seg {
+    std::vector<float> pcm;
+    int64_t t0;
+    int64_t t1;
+};
+
+int whisper_full_stream(
+        struct whisper_context * ctx,
+    struct whisper_full_params   params,
+   whisper_stream_read_callback   read,
+                           void * read_user_data,
+                            int   n_batch) {
+    if (ctx == nullptr || read == nullptr) {
+        return -1;
+    }
+    if (n_batch < 2) {
+        n_batch = 2;
+    }
+
+    auto & state = *ctx->state;
+
+    if (params.strategy != WHISPER_SAMPLING_GREEDY || params.beam_search.beam_size > 1 || params.greedy.best_of > 1) {
+        WHISPER_LOG_ERROR("%s: streaming only supports greedy decoding (best_of = 1, beam_size = 1)\n", __func__);
+        return -1;
+    }
+    if (!ctx->params.flash_attn) {
+        WHISPER_LOG_ERROR("%s: streaming requires flash attention\n", __func__);
+        return -1;
+    }
+    if (params.language == nullptr || strlen(params.language) == 0 || strcmp(params.language, "auto") == 0 || params.detect_language) {
+        WHISPER_LOG_ERROR("%s: streaming requires an explicit language\n", __func__);
+        return -1;
+    }
+    if (params.vad_model_path == nullptr || strlen(params.vad_model_path) == 0) {
+        WHISPER_LOG_ERROR("%s: streaming requires a VAD model (params.vad_model_path)\n", __func__);
+        return -1;
+    }
+    if (whisper_encode_external(state) || whisper_cross_external(state)) {
+        WHISPER_LOG_ERROR("%s: streaming is not supported with an external encoder\n", __func__);
+        return -1;
+    }
+
+    // the streaming path is greedy-only and does not implement timestamp decoding
+    params.strategy              = WHISPER_SAMPLING_GREEDY;
+    params.greedy.best_of        = 1;
+    params.beam_search.beam_size = 1;
+    params.temperature           = 0.0f;
+    params.temperature_inc       = 0.0f;
+    params.no_timestamps         = true;
+    params.token_timestamps      = false;
+    params.max_tokens            = 0;
+
+    state.result_all.clear();
+    state.prompt_past0.clear();
+    state.prompt_past1.clear();
+    state.vad_segments.clear();
+    state.vad_mapping_table.clear();
+    state.has_vad_segments = false;
+
+    if (params.audio_ctx > whisper_n_audio_ctx(ctx)) {
+        WHISPER_LOG_ERROR("%s: audio_ctx is larger than the maximum allowed (%d > %d)\n", __func__, params.audio_ctx, whisper_n_audio_ctx(ctx));
+        return -5;
+    }
+    state.exp_n_audio_ctx = params.audio_ctx;
+
+    // VAD context: the audio thread runs the Silero model incrementally, preserving
+    // the LSTM state between blocks (whisper_vad_detect_speech_no_reset).
+    if (state.vad_context == nullptr) {
+        struct whisper_vad_context_params vad_ctx_params = whisper_vad_default_context_params();
+        state.vad_context = whisper_vad_init_from_file_with_params(params.vad_model_path, vad_ctx_params);
+        if (state.vad_context == nullptr) {
+            WHISPER_LOG_ERROR("%s: failed to initialize VAD context\n", __func__);
+            return -1;
+        }
+    }
+    whisper_vad_reset_state(state.vad_context);
+
+    const int n_window = state.vad_context->n_window;
+
+    // 30 s is the encoder context: the cap below bounds both RAM and the KV cache
+    const int64_t max_len_cs = 3000;
+    const int max_gen = std::max(32, (int) std::min<int64_t>(ctx->model.hparams.n_text_ctx, 16 + (max_len_cs * 4)/100));
+
+    if (!whisper_state_prepare_batched(*ctx, state, n_batch, max_gen)) {
+        return -1;
+    }
+
+    whisper_batch_workspace ws;
+    if (!whisper_batch_workspace_init(*ctx, state, params, n_batch, max_gen, ws)) {
+        WHISPER_LOG_ERROR("%s: failed to initialize the batched workspace\n", __func__);
+        return -1;
+    }
+
+    // -----------------------------------------------------------------------
+    // audio thread: read -> resample (done by the callback) -> incremental VAD ->
+    // completed speech segments. It runs concurrently with the batched decoder, so
+    // transcoding and VAD never stall the GPU.
+    // -----------------------------------------------------------------------
+    struct stream_shared {
+        std::mutex mutex;
+        std::condition_variable cv_data;
+        std::condition_variable cv_space;
+
+        std::deque<whisper_stream_pool_seg> queue;
+        size_t queue_cap = 0;
+
+        bool done   = false;
+        bool failed = false;
+        bool stop   = false;
+
+        int         fail_ret = -1;
+        std::string fail_msg;
+
+        int64_t n_read    = 0;
+        int64_t t_read_us = 0;
+        int64_t t_vad_us  = 0;
+        int64_t t_seg_us  = 0;
+    };
+
+    stream_shared sh;
+    sh.queue_cap = (size_t) 2*n_batch;
+
+    auto produce = [&]() {
+        std::vector<float> block(WHISPER_SAMPLE_RATE); // 1 s per read
+        std::vector<float> pcm;                        // bounded rolling window
+        int64_t pcm_base = 0;
+
+        std::vector<float> vad_pending;                // < one VAD window leftover
+        std::vector<whisper_stream_segment> segs;
+
+        whisper_vad_stream_segmenter segmenter;
+        segmenter.init(params.vad_params, n_window);
+
+        auto finish = [&](bool failed, int ret, const char * msg) {
+            std::lock_guard<std::mutex> lock(sh.mutex);
+            sh.failed  = failed;
+            sh.fail_ret = ret;
+            if (msg != nullptr) {
+                sh.fail_msg = msg;
+            }
+            sh.done = true;
+            sh.cv_data.notify_all();
+            sh.cv_space.notify_all();
+        };
+
+        auto push_segment = [&](whisper_stream_pool_seg && seg) -> bool {
+            std::unique_lock<std::mutex> lock(sh.mutex);
+            sh.cv_space.wait(lock, [&]() { return sh.stop || sh.queue.size() < sh.queue_cap; });
+            if (sh.stop) {
+                return false;
+            }
+            sh.queue.push_back(std::move(seg));
+            sh.cv_data.notify_one();
+            return true;
+        };
+
+        auto emit = [&](const std::vector<whisper_stream_segment> & new_segs) -> bool {
+            for (const auto & s : new_segs) {
+                // Convert through centiseconds exactly like whisper_full_batched() does
+                // (VAD segments are stored in cs, then converted back to samples) so both
+                // paths feed identical sample ranges to the encoder.
+                const int64_t cs0 = samples_to_cs((int) s.start);
+                const int64_t cs1 = samples_to_cs((int) s.end);
+
+                const int64_t s0 = std::max<int64_t>(0, (cs0 * WHISPER_SAMPLE_RATE) / 100);
+                const int64_t s1 = std::min<int64_t>(sh.n_read, std::max<int64_t>(s0, (cs1 * WHISPER_SAMPLE_RATE) / 100));
+                if (s1 <= s0) {
+                    continue;
+                }
+
+                const int64_t off = s0 - pcm_base;
+                if (off < 0 || off + (s1 - s0) > (int64_t) pcm.size()) {
+                    WHISPER_LOG_ERROR("%s: internal error: segment [%lld, %lld) outside the retained buffer\n",
+                            __func__, (long long) s0, (long long) s1);
+                    finish(true, -1, nullptr);
+                    return false;
+                }
+
+                if (getenv("WHISPER_STREAM_DEBUG_SEGMENTS") != nullptr) {
+                    fprintf(stderr, "STREAM_SEG %lld %lld\n", (long long) cs0, (long long) cs1);
+                }
+
+                whisper_stream_pool_seg seg;
+                seg.pcm.assign(pcm.begin() + off, pcm.begin() + off + (s1 - s0));
+                seg.t0 = cs0;
+                seg.t1 = cs1;
+                if (!push_segment(std::move(seg))) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        while (true) {
+            {
+                std::lock_guard<std::mutex> lock(sh.mutex);
+                if (sh.stop) {
+                    finish(false, 0, nullptr);
+                    return;
+                }
+            }
+
+            int got = 0;
+            {
+                const int64_t t0 = ggml_time_us();
+                got = read(block.data(), (int) block.size(), read_user_data);
+                sh.t_read_us += ggml_time_us() - t0;
+            }
+            if (got < 0) {
+                finish(true, -2, "failed to read PCM data");
+                return;
+            }
+            if (got == 0) {
+                break;
+            }
+
+            sh.n_read += got;
+            pcm.insert(pcm.end(), block.begin(), block.begin() + got);
+            vad_pending.insert(vad_pending.end(), block.begin(), block.begin() + got);
+
+            const int64_t t_vad0 = ggml_time_us();
+            const int n_win = (int) (vad_pending.size() / n_window);
+            if (n_win > 0) {
+                if (!whisper_vad_detect_speech_no_reset(state.vad_context, vad_pending.data(), n_win*n_window)) {
+                    finish(true, -3, "failed to run VAD");
+                    return;
+                }
+
+                const float * probs = whisper_vad_probs(state.vad_context);
+                for (int i = 0; i < n_win; ++i) {
+                    segmenter.feed(probs[i]);
+                }
+
+                vad_pending.erase(vad_pending.begin(), vad_pending.begin() + n_win*n_window);
+            }
+            sh.t_vad_us += ggml_time_us() - t_vad0;
+
+            const int64_t t_seg0 = ggml_time_us();
+            segs.clear();
+            segmenter.poll(sh.n_read, segs);
+            if (!emit(segs)) {
+                return;
+            }
+
+            // release audio that no future segment can reference
+            const int64_t keep_from = segmenter.retain_from(sh.n_read, sh.n_read - (int64_t) vad_pending.size());
+            if (keep_from > pcm_base) {
+                const int64_t n_drop = std::min<int64_t>(keep_from - pcm_base, (int64_t) pcm.size());
+                pcm.erase(pcm.begin(), pcm.begin() + n_drop);
+                pcm_base += n_drop;
+            }
+            sh.t_seg_us += ggml_time_us() - t_seg0;
+        }
+
+        // flush the remaining VAD windows (the last one may be zero padded)
+        if (!vad_pending.empty()) {
+            const int64_t t_vad0 = ggml_time_us();
+            if (!whisper_vad_detect_speech_no_reset(state.vad_context, vad_pending.data(), (int) vad_pending.size())) {
+                finish(true, -3, "failed to run VAD");
+                return;
+            }
+            const int n_win = whisper_vad_n_probs(state.vad_context);
+            const float * probs = whisper_vad_probs(state.vad_context);
+            for (int i = 0; i < n_win; ++i) {
+                segmenter.feed(probs[i]);
+            }
+            sh.t_vad_us += ggml_time_us() - t_vad0;
+            vad_pending.clear();
+        }
+
+        {
+            const int64_t t_seg0 = ggml_time_us();
+            segs.clear();
+            segmenter.flush(sh.n_read, segs);
+            if (!emit(segs)) {
+                return;
+            }
+            sh.t_seg_us += ggml_time_us() - t_seg0;
+        }
+
+        finish(false, 0, nullptr);
+    };
+
+    // -----------------------------------------------------------------------
+    // decode thread (this one): drain segments, batch them and run the GPU.
+    // -----------------------------------------------------------------------
+    std::vector<whisper_stream_pool_seg> pool;
+    std::vector<whisper_batch_result>    decoded;
+    int64_t t_decode_us = 0;
+
+    auto decode_pool = [&]() -> bool {
+        if (pool.empty()) {
+            return true;
+        }
+
+        const int64_t t_dec0 = ggml_time_us();
+
+        // Sort longest first: a lockstep group costs as many steps as its longest
+        // lane, so homogeneous groups waste fewer steps. Results are re-sorted
+        // chronologically before they are exposed.
+        std::stable_sort(pool.begin(), pool.end(), [](const whisper_stream_pool_seg & a, const whisper_stream_pool_seg & b) {
+            return a.pcm.size() > b.pcm.size();
+        });
+
+        decoded.clear();
+        for (size_t i = 0; i < pool.size(); i += n_batch) {
+            const int nb = (int) std::min<size_t>(n_batch, pool.size() - i);
+
+            std::vector<whisper_batch_view> views(nb);
+            for (int b = 0; b < nb; ++b) {
+                const auto & s = pool[i + b];
+                views[b].samples   = s.pcm.data();
+                views[b].n_samples = (int) s.pcm.size();
+                views[b].t0        = s.t0;
+                views[b].t1        = s.t1;
+                views[b].disp_t0   = s.t0;
+                views[b].disp_t1   = s.t1;
+            }
+
+            std::vector<whisper_batch_result> group;
+            if (!whisper_batch_decode_group(*ctx, state, params, ws, views.data(), nb, group)) {
+                WHISPER_LOG_ERROR("%s: failed to decode batch\n", __func__);
+                return false;
+            }
+            for (auto & r : group) {
+                decoded.push_back(std::move(r));
+            }
+        }
+
+        std::sort(decoded.begin(), decoded.end(), [](const whisper_batch_result & a, const whisper_batch_result & b) {
+            return a.segment.t0 < b.segment.t0;
+        });
+
+        int n_new = 0;
+        for (auto & r : decoded) {
+            if (params.print_realtime) {
+                if (params.print_timestamps) {
+                    printf("[%s --> %s]  %s\n", to_timestamp(r.disp_t0).c_str(), to_timestamp(r.disp_t1).c_str(), r.segment.text.c_str());
+                } else {
+                    printf("%s", r.segment.text.c_str());
+                    fflush(stdout);
+                }
+            }
+            state.result_all.push_back(std::move(r.segment));
+            ++n_new;
+        }
+
+        if (params.new_segment_callback && n_new > 0) {
+            params.new_segment_callback(ctx, &state, n_new, params.new_segment_callback_user_data);
+        }
+
+        pool.clear();
+
+        t_decode_us += ggml_time_us() - t_dec0;
+        return true;
+    };
+
+    const int64_t t_start_us = ggml_time_us();
+
+    std::thread worker(produce);
+
+    int ret = 0;
+    bool aborted = false;
+
+    while (!aborted) {
+        bool eof = false;
+        bool failed = false;
+
+        {
+            std::unique_lock<std::mutex> lock(sh.mutex);
+            sh.cv_data.wait(lock, [&]() { return !sh.queue.empty() || sh.done || sh.failed; });
+
+            while (!sh.queue.empty() && pool.size() < (size_t) 2*n_batch) {
+                pool.push_back(std::move(sh.queue.front()));
+                sh.queue.pop_front();
+            }
+            sh.cv_space.notify_all();
+
+            failed = sh.failed;
+            eof    = sh.done && sh.queue.empty();
+        }
+
+        if (params.abort_callback && params.abort_callback(params.abort_callback_user_data)) {
+            aborted = true;
+            break;
+        }
+
+        if (failed) {
+            ret = sh.fail_ret;
+            if (!sh.fail_msg.empty()) {
+                WHISPER_LOG_ERROR("%s: %s\n", __func__, sh.fail_msg.c_str());
+            }
+            break;
+        }
+
+        if (pool.size() >= (size_t) 2*n_batch || (eof && !pool.empty())) {
+            if (!decode_pool()) {
+                ret = -6;
+                break;
+            }
+        }
+
+        if (eof && pool.empty()) {
+            break;
+        }
+    }
+
+    if (aborted) {
+        WHISPER_LOG_INFO("%s: aborted\n", __func__);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(sh.mutex);
+        sh.stop = true;
+        sh.cv_data.notify_all();
+        sh.cv_space.notify_all();
+    }
+    worker.join();
+
+    if (aborted) {
+        return -7;
+    }
+
+    const int64_t t_end_us = ggml_time_us();
+
+    if (getenv("WHISPER_STREAM_DEBUG") != nullptr) {
+        const double wall = 1e-6*(t_end_us - t_start_us);
+        fprintf(stderr, "STREAM_DEBUG: audio=%.2fs wall=%.2fs read=%.2fs vad=%.2fs decode=%.2fs segments=%.2fs n_segments=%d decode_fraction=%.1f%%\n",
+                (double) sh.n_read/WHISPER_SAMPLE_RATE,
+                wall,
+                1e-6*sh.t_read_us,
+                1e-6*sh.t_vad_us,
+                1e-6*t_decode_us,
+                1e-6*sh.t_seg_us,
+                (int) state.result_all.size(),
+                wall > 0.0 ? 100.0*(double) t_decode_us/(double) (t_end_us - t_start_us) : 0.0);
+    }
+
+    return ret;
+}
+
 
 int whisper_full_n_segments_from_state(struct whisper_state * state) {
     return state->result_all.size();

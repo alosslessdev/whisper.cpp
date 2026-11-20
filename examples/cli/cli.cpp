@@ -1,5 +1,6 @@
 #include "common.h"
 #include "common-whisper.h"
+#include "stream-audio.h"
 
 #include "whisper.h"
 #include "grammar-parser.h"
@@ -81,6 +82,7 @@ struct whisper_params {
     int32_t gpu_device   = 0;
     bool suppress_nst    = false;
     bool carry_initial_prompt = false;
+    bool stream          = false; // decode from disk and transcribe concurrently (batched only)
 
     std::string language  = "en";
     std::string prompt;
@@ -168,6 +170,7 @@ static bool whisper_params_parse(int argc, char ** argv, whisper_params & params
         else if (arg == "-bs"   || arg == "--beam-size")            { params.beam_size       = std::stoi(ARGV_NEXT); }
         else if (arg == "-ac"   || arg == "--audio-ctx")            { params.audio_ctx       = std::stoi(ARGV_NEXT); }
         else if (arg == "-bsz"  || arg == "--batch-size")           { params.batch_size      = std::stoi(ARGV_NEXT); }
+        else if (arg == "-stream" || arg == "--stream")             { params.stream          = true; }
         else if (arg == "-wt"   || arg == "--word-thold")           { params.word_thold      = std::stof(ARGV_NEXT); }
         else if (arg == "-et"   || arg == "--entropy-thold")        { params.entropy_thold   = std::stof(ARGV_NEXT); }
         else if (arg == "-lpt"  || arg == "--logprob-thold")        { params.logprob_thold   = std::stof(ARGV_NEXT); }
@@ -253,6 +256,7 @@ static void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params
     fprintf(stderr, "  -bs N,     --beam-size N          [%-7d] beam size for beam search\n",                      params.beam_size);
     fprintf(stderr, "  -ac N,     --audio-ctx N          [%-7d] audio context size (0 - all)\n",                   params.audio_ctx);
     fprintf(stderr, "  -bsz N,    --batch-size N         [%-7d] batch size for batched inference (> 1 enables it; requires --vad, greedy)\n", params.batch_size);
+    fprintf(stderr, "  -stream,   --stream               [%-7s] transcode from disk and transcribe concurrently (needs --batch-size > 1)\n", params.stream ? "true" : "false");
     fprintf(stderr, "  -wt N,     --word-thold N         [%-7.2f] word timestamp probability threshold\n",         params.word_thold);
     fprintf(stderr, "  -et N,     --entropy-thold N      [%-7.2f] entropy threshold for decoder fail\n",           params.entropy_thold);
     fprintf(stderr, "  -lpt N,    --logprob-thold N      [%-7.2f] log probability threshold for decoder fail\n",   params.logprob_thold);
@@ -1049,6 +1053,41 @@ int main(int argc, char ** argv) {
         exit(0);
     }
 
+    if (params.stream) {
+        if (params.batch_size < 2) {
+            fprintf(stderr, "error: --stream requires --batch-size N with N > 1\n");
+            whisper_print_usage(argc, argv, params);
+            return 1;
+        }
+        if (params.language == "auto" || params.detect_language) {
+            fprintf(stderr, "error: --stream requires an explicit language (auto-detection needs the whole file)\n");
+            return 1;
+        }
+        if (params.diarize || params.tinydiarize) {
+            fprintf(stderr, "error: --stream does not support diarization\n");
+            return 1;
+        }
+        if (params.offset_t_ms != 0 || params.duration_ms != 0) {
+            fprintf(stderr, "error: --stream does not support --offset or --duration\n");
+            return 1;
+        }
+        if (!params.grammar.empty()) {
+            fprintf(stderr, "error: --stream only supports greedy decoding\n");
+            return 1;
+        }
+        if (params.output_wts || params.output_jsn_full) {
+            fprintf(stderr, "error: --stream does not produce token-level timestamps\n");
+            return 1;
+        }
+        for (const auto & fname : params.fname_inp) {
+            if (fname == "-") {
+                fprintf(stderr, "error: --stream reads from disk; stdin ('-') is not supported\n");
+                return 1;
+            }
+        }
+        params.vad = true;
+    }
+
     if (params.diarize && params.tinydiarize) {
         fprintf(stderr, "error: cannot use both --diarize and --tinydiarize\n");
         whisper_print_usage(argc, argv, params);
@@ -1181,7 +1220,17 @@ int main(int argc, char ** argv) {
         std::vector<float> pcmf32;               // mono-channel F32 PCM
         std::vector<std::vector<float>> pcmf32s; // stereo-channel F32 PCM
 
-        if (!::read_audio_data(fname_inp, pcmf32, pcmf32s, params.diarize)) {
+        // In stream mode the file is decoded/resampled on a worker thread while the
+        // GPU decodes the previous batches; pcmf32 stays empty and is never used.
+        stream_audio_reader reader;
+
+        if (params.stream) {
+            if (!reader.open(fname_inp, 30*WHISPER_SAMPLE_RATE)) {
+                fprintf(stderr, "error: %s\n", reader.error().c_str());
+                n_failed++;
+                continue;
+            }
+        } else if (!::read_audio_data(fname_inp, pcmf32, pcmf32s, params.diarize)) {
             fprintf(stderr, "error: failed to read audio file '%s'\n", fname_inp.c_str());
             n_failed++;
             continue;
@@ -1206,13 +1255,22 @@ int main(int argc, char ** argv) {
 
             // print some info about the processing
             fprintf(stderr, "\n");
-            fprintf(stderr, "%s: processing '%s' (%d samples, %.1f sec), %d threads, %d processors, %d beams + best of %d, lang = %s, task = %s, %stimestamps = %d ...\n",
-                    __func__, fname_inp.c_str(), int(pcmf32.size()), float(pcmf32.size())/WHISPER_SAMPLE_RATE,
-                    params.n_threads, params.n_processors, params.beam_size, params.best_of,
-                    params.language.c_str(),
-                    params.translate ? "translate" : "transcribe",
-                    params.tinydiarize ? "tdrz = 1, " : "",
-                    params.no_timestamps ? 0 : 1);
+            if (params.stream) {
+                fprintf(stderr, "%s: streaming '%s' (%.1f sec), %d threads, batch = %d, lang = %s, task = %s, timestamps = %d ...\n",
+                        __func__, fname_inp.c_str(), reader.duration(),
+                        params.n_threads, params.batch_size,
+                        params.language.c_str(),
+                        params.translate ? "translate" : "transcribe",
+                        params.no_timestamps ? 0 : 1);
+            } else {
+                fprintf(stderr, "%s: processing '%s' (%d samples, %.1f sec), %d threads, %d processors, %d beams + best of %d, lang = %s, task = %s, %stimestamps = %d ...\n",
+                        __func__, fname_inp.c_str(), int(pcmf32.size()), float(pcmf32.size())/WHISPER_SAMPLE_RATE,
+                        params.n_threads, params.n_processors, params.beam_size, params.best_of,
+                        params.language.c_str(),
+                        params.translate ? "translate" : "transcribe",
+                        params.tinydiarize ? "tdrz = 1, " : "",
+                        params.no_timestamps ? 0 : 1);
+            }
 
             if (params.print_colors) {
                 fprintf(stderr, "%s: color scheme: red (low confidence), yellow (medium), green (high confidence)\n", __func__);
@@ -1333,7 +1391,24 @@ int main(int argc, char ** argv) {
             }
 
             int ret;
-            if (params.batch_size > 0) {
+            if (params.stream) {
+                // the audio comes from the reader's worker thread; whisper_full_stream
+                // pulls 1 s blocks while its GPU decode of previous batches is done
+                auto read_pcm = [](float * samples, int n_samples, void * user_data) -> int {
+                    return ((stream_audio_reader *) user_data)->read(samples, n_samples);
+                };
+
+                wparams.strategy              = WHISPER_SAMPLING_GREEDY;
+                wparams.greedy.best_of        = 1;
+                wparams.beam_search.beam_size = 1;
+                wparams.temperature_inc       = 0.0f;
+                wparams.no_timestamps         = true;
+
+                ret = whisper_full_stream(ctx, wparams, read_pcm, &reader, params.batch_size);
+                if (ret != 0 && !reader.error().empty()) {
+                    fprintf(stderr, "%s: %s\n", argv[0], reader.error().c_str());
+                }
+            } else if (params.batch_size > 0) {
                 // batched inference: greedy-only, requires VAD
                 wparams.strategy              = WHISPER_SAMPLING_GREEDY;
                 wparams.greedy.best_of        = 1;
@@ -1346,7 +1421,7 @@ int main(int argc, char ** argv) {
             }
 
             if (ret != 0) {
-                fprintf(stderr, "%s: failed to process audio\n", argv[0]);
+                fprintf(stderr, "%s: failed to process audio (ret = %d)\n", argv[0], ret);
                 whisper_free(ctx);
                 return 10;
             }

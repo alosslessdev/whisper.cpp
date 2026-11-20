@@ -644,6 +644,31 @@ extern "C" {
                                    int   n_samples,
                                    int   n_batch);
 
+    // Streaming batched inference: pull PCM (mono, 16 kHz, f32) from a callback and
+    // transcribe it as it arrives. The whole file is never buffered: VAD runs
+    // incrementally and completed speech segments are decoded in groups of up to
+    // n_batch, so memory is bounded by the segments in flight, independent of the
+    // input length.
+    //
+    // The callback is called from an internal audio thread and may block. It should
+    // feed this thread from a bounded queue filled by another thread (decode /
+    // transcode the file in the background), so the decoder never waits on I/O.
+    // Returns the number of samples written, 0 at end of stream, or a negative value
+    // on error.
+    //
+    // Requirements: greedy sampling (best_of = 1, beam_size = 1), flash attention, an
+    // explicit language (not "auto"), and params.vad_model_path. Results are stored in
+    // the default state; params.new_segment_callback is called with the segments of
+    // each decoded group in chronological order.
+    typedef int (*whisper_stream_read_callback)(float * samples, int n_samples, void * user_data);
+
+    WHISPER_API int whisper_full_stream(
+                struct whisper_context * ctx,
+            struct whisper_full_params   params,
+               whisper_stream_read_callback read,
+                                       void * read_user_data,
+                                        int   n_batch);
+
     // Number of generated text segments
     // A segment can be a few words, a sentence, or even a paragraph.
     WHISPER_API int whisper_full_n_segments           (struct whisper_context * ctx);
